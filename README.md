@@ -1,187 +1,209 @@
-# Módulo 3: Oscilaciones por viento
+# Módulo 3: Oscilaciones por viento (+ apoyo al Módulo 1)
 
-En este módulo simulo cómo vibra una estructura (por ejemplo, un puente o una torre) cuando el viento la excita. Todo está en un solo archivo de Python: implementé yo mismo los métodos numéricos desde cero (sin NumPy ni SciPy), armé tres escenarios de prueba y expuse los resultados mediante una pequeña API con Flask para que mi compañero los consuma desde la web.
+Parte del Integrante 2 del proyecto **SIMTELE-RISK** (Métodos Numéricos). Simulo cómo vibra una estructura bajo la acción del viento, resuelvo la ecuación con Runge-Kutta, integro la magnitud acumulada `x(t)²` y compruebo todo contra soluciones exactas. Además doy apoyo al Módulo 1 (detención de cabinas) con RK2, RK4 e integración.
+
+Todo está en un solo archivo, `modulo3_completo.py`. Los métodos numéricos están programados desde cero, sin NumPy ni SciPy. Solo se usan `flask` (API) y `matplotlib` (gráficos).
 
 ---
 
-## 1. El modelo físico
+## 1. Cómo ejecutarlo
 
-Modelo la estructura como un **oscilador amortiguado con fuerza externa**:
+```bash
+pip install flask matplotlib
+python modulo3_completo.py
+```
+
+| Comando | Qué hace |
+|---|---|
+| `python modulo3_completo.py` | Consola, gráficos y API |
+| `python modulo3_completo.py --sin-servidor` | Consola y gráficos (sin Flask) |
+| `python modulo3_completo.py --sin-graficos` | Consola y API |
+| `python modulo3_completo.py --mostrar` | Además abre las ventanas de los gráficos |
+| `python modulo3_completo.py --json` | Guarda `resultados_modulo3.json` |
+
+Los gráficos se guardan en la carpeta `graficos_modulo3/`. La API queda en `http://localhost:5001` y se detiene con `Ctrl+C`. Sin `flask` o sin `matplotlib` el archivo sigue funcionando; solo avisa qué falta.
+
+---
+
+## 2. El modelo físico
+
+Una estructura de masa `m`, amortiguamiento `c` y rigidez `k` excitada por una fuerza de viento:
 
 ```
-m·x''(t) + c·x'(t) + k·x(t) = F(t)
+m·x''(t) + c·x'(t) + k·x(t) = F(t),     F(t) = F0·sin(wf·t)
 ```
 
-| Símbolo | Significado | Valor que uso |
-|---|---|---|
-| `m` | masa | 800 |
-| `c` | amortiguamiento | 120 (normal y estrés) / 0.5 (mal condicionado) |
-| `k` | rigidez del resorte | 4000 |
-| `F(t)` | fuerza del viento | 0 o `500·sin(2t)` según el escenario |
-| `x` | desplazamiento | incógnita |
-| `v = x'` | velocidad | incógnita |
-
-Los métodos de Runge-Kutta trabajan con ecuaciones de **primer orden**, así que convierto la ecuación de segundo orden en un sistema de dos ecuaciones con el vector `y = [x, v]`:
+Para usar Runge-Kutta paso la ecuación de segundo orden a un sistema de primer orden con `y = [x, v]`:
 
 ```
 x' = v
 v' = (F(t) − c·v − k·x) / m
 ```
 
-Esto es exactamente lo que hace la función `f_oscilador(t, y, m, c, k, F)`: recibe el estado actual y devuelve sus derivadas `[v, (F(t) - c*v - k*x)/m]`.
+Eso es lo que hace `f_oscilador(t, y, m, c, k, F)`. Con `m = 800` y `k = 4000`, la frecuencia natural es `w0 = √(k/m) ≈ 2.236 rad/s`.
 
 ---
 
-## 2. Los métodos numéricos (sección 1 del código)
+## 3. Métodos numéricos
 
-### Para resolver la ecuación diferencial
+**Ecuaciones diferenciales** (firma común `(f, t0, y0, tf, h, params)`):
 
-- **`rk2_heun`**: Runge-Kutta de 2.º orden (método de Heun). En cada paso calculo la pendiente al inicio (`k1`), doy un paso de prueba tipo Euler (`y_pred`), calculo la pendiente al final (`k2`) y avanzo con el **promedio** de las dos pendientes.
-- **`rk4`**: Runge-Kutta clásico de 4.º orden. Calculo cuatro pendientes (`k1` a `k4`) y avanzo con el promedio ponderado `(k1 + 2·k2 + 2·k3 + k4)/6`. Es más preciso que Heun con el mismo paso `h`, aunque cuesta más evaluaciones de `f` por paso.
+- `rk2_heun`: Runge-Kutta de 2.º orden, variante de Heun (promedio de la pendiente inicial y la final).
+- `rk4`: Runge-Kutta clásico de 4.º orden.
 
-Las dos funciones tienen la misma firma: `(f, t0, y0, tf, h, params)`. Devuelven la lista de tiempos `ts` y la lista de estados `ys`. El número de pasos lo calculo con `n = round((tf - t0)/h)`.
+**Integración**, en dos versiones: sobre una función `f(x)` y sobre datos equiespaciados (la solución numérica):
 
-### Para calcular integrales
+| Sobre una función | Sobre datos | Nota |
+|---|---|---|
+| `trapecio_compuesto` | `trapecio_datos` | |
+| `simpson13_compuesto` | `simpson_datos` | `n` debe ser par |
+| `romberg`, `romberg_tabla` | `romberg_datos` | Sobre datos exige `n = 2^m` |
 
-Más adelante necesito integrar `x(t)²` (una medida de la energía de la vibración), así que implementé tres métodos:
-
-- **`trapecio_compuesto(f, a, b, n)`**: aproxima el área con `n` trapecios.
-- **`simpson13_compuesto(f, a, b, n)`**: usa parábolas en lugar de rectas. Exige que `n` sea **par**; si no, lanza `ValueError`.
-- **`romberg(f, a, b, nivel_max, tol)`**: parte del trapecio y aplica **extrapolación de Richardson** para ir mejorando la precisión. Se detiene antes si la diferencia entre dos niveles consecutivos de la diagonal es menor que `tol`.
-
----
-
-## 3. La solución analítica (mi "verdad" de referencia)
-
-`solucion_analitica(t, x0, v0, m, c, k)` calcula la solución exacta del caso **sin fuerza externa y subamortiguado**:
-
-```
-ω0 = √(k/m)                 (frecuencia natural)
-ζ  = c / (2·√(k·m))         (razón de amortiguamiento)
-ωd = ω0·√(1 − ζ²)           (frecuencia amortiguada)
-
-x(t) = e^(−ζ·ω0·t) · [ C1·cos(ωd·t) + C2·sin(ωd·t) ]
-C1 = x0,    C2 = (v0 + ζ·ω0·x0) / ωd
-```
-
-Si `ζ ≥ 1` el sistema ya no oscila (sobreamortiguado o crítico) y esta fórmula no aplica, por eso lanzo un error en ese caso. Con mis parámetros, `ζ ≈ 0.034` en los escenarios normal y de estrés, y `ζ ≈ 0.00014` en el mal condicionado, así que siempre estoy en el caso subamortiguado.
+**Errores** (`error_abs`, `error_rel`): el error relativo devuelve `None` si la referencia es cero o casi cero, para no dividir entre cero.
 
 ---
 
-## 4. Los tres escenarios (sección 2 del código)
+## 4. Soluciones exactas (referencia)
 
-Cada escenario es una función que corre RK2 y RK4, mide el error, calcula las integrales de `x²` y devuelve todo en un diccionario.
+- `solucion_analitica`: vibración libre subamortiguada, `x(t) = e^(−ζ·w0·t)·[C1·cos(wd·t) + C2·sin(wd·t)]`.
+- `solucion_analitica_forzada`: solución exacta con viento `F0·sin(wf·t)`, igual a la solución particular más la homogénea. Devuelve `(x, v)`. Con `F0 = 0` coincide con la libre.
 
-### `escenario_normal()`: el caso "sano"
+Requieren `ζ < 1`. Con mis parámetros `ζ ≈ 0.0335` (normal y estrés) y `ζ ≈ 0.00014` (mal condicionado).
 
-- Condiciones: `x0 = 1`, `v0 = 0`, sin viento (`F = 0`), `h = 0.01`, de `t = 0` a `10`.
-- Como aquí existe solución exacta, el **error máximo** de RK2 y RK4 lo calculo contra `solucion_analitica` en cada punto.
-- Integro `x²` con Trapecio y Simpson (`n = 1000`) y con Romberg (nivel 6).
-- Es el escenario donde espero ver que **RK4 es muchísimo más preciso que RK2**.
-
-### `escenario_estres()`: viento fuerte cerca de la resonancia
-
-- Condiciones: parto del reposo (`x0 = 0`, `v0 = 0`) y aplico `F(t) = 500·sin(2t)`. La frecuencia del viento (2 rad/s) está muy cerca de la frecuencia natural de la estructura (≈ 2.236 rad/s), lo que provoca una amplificación fuerte.
-- Uso un paso **grande** (`h = 0.25`) a propósito, para ver cómo se degradan los métodos.
-- Con fuerza externa no tengo solución analítica (por eso `"analitica": []`). Como referencia calculo una solución **RK4 con paso muy fino** (`h = 0.001`) y comparo contra ella en los mismos tiempos.
-- Integración con `n = 200` y Romberg nivel 5.
-
-### `escenario_mal_condicionado()`: casi sin amortiguamiento y paso grande
-
-- Condiciones: `c = 0.5` (amortiguamiento casi nulo), `h = 0.30` (paso grande), sin viento.
-- Es un caso difícil: la oscilación casi no se disipa y el paso es grande respecto al período, por lo que los errores numéricos se acumulan y se notan mucho.
-- El error se mide contra la referencia RK4 con `h = 0.001`; además devuelvo la solución analítica para graficar.
-- Integración con `n = 300` y Romberg nivel 5.
-
-**Sobre la referencia fina:** para comparar, tomo el valor de la solución de referencia en el índice `round(t/0.001)` de cada tiempo `t` de la malla gruesa.
+Gracias a la solución forzada, **los tres escenarios se comparan contra una solución exacta**, sin usar una referencia numérica.
 
 ---
 
-## 5. Prueba por consola (sección 3 del código)
+## 5. Los tres escenarios
 
-`probar_en_consola()` ejecuta los tres escenarios e imprime, para cada uno:
+| | NORMAL | ESTRÉS | MAL CONDICIONADO |
+|---|---|---|---|
+| `c` | 120 | 120 | 0.5 |
+| Viento `F(t)` | 0 | `500·sin(2t)` | `500·sin(0.99·w0·t)` |
+| Duración `T` | 10.24 s | 16 s | 40.96 s |
+| Subintervalos `n` | 1024 (h = 0.01) | 64 (h = 0.25) | 2048 (h = 0.02) |
 
-- Error máximo de RK2
-- Error máximo de RK4
-- Integral de `x²` por Trapecio, Simpson y Romberg
+Cada `n` es potencia de 2 para poder aplicar Romberg a la solución numérica.
 
-La uso para verificar rápido que los números tienen sentido antes de conectar la web.
+**Normal.** Vibración libre con paso fino. Es el caso de control.
+
+**Estrés.** Viento cerca de la resonancia (2 rad/s frente a 2.236), **paso 25 veces mayor** y más tiempo. Es una exigencia mayor del modelo: RK2 pierde precisión (error y desfase visibles en el gráfico) y RK4 aguanta.
+
+**Mal condicionado.** Es un **subexperimento de sensibilidad**, no un caso de paso grande o falta de convergencia. Con amortiguamiento casi nulo y el viento en `0.99·w0`, la amplitud permanente `X(w) = F0 / √((k − m·w²)² + (c·w)²)` es extremadamente sensible a `wf`: un **1 % de cambio en `wf`** hace pasar la amplitud de **6.28 m a 363.7 m** (se multiplica por 58). La función `sensibilidad_amplitud` devuelve ese factor y el gráfico `m3_mal_condicionado_sensibilidad.png` lo muestra.
+
+Esta distinción importa: el mal condicionamiento es una propiedad del **problema** (cuánto cambia la salida ante un cambio pequeño en los datos), no una falla del método, y no se confunde con inestabilidad, paso grande o riesgo físico.
+
+### Resultados
+
+| Escenario | Error máx. RK2 | Error máx. RK4 | Integral de x² (referencia) | Error de Simpson sobre RK4 |
+|---|---|---|---|---|
+| Normal | 8.6e-4 | 2.1e-8 | 2.653990 | 1.5e-8 |
+| Estrés | 4.8e-1 | 8.3e-3 | 3.353760 | 5.8e-3 |
+| Mal condicionado | 8.1e-2 | 8.1e-6 | 212.810845 | 5.3e-6 |
+
+El error máximo se mide sobre `x(t)` en todos los instantes de la malla, contra la solución exacta.
 
 ---
 
-## 6. La API (sección 4 del código)
+## 6. Integración de la magnitud acumulada
 
-Creo una app Flask con una sola ruta:
+La magnitud es `∫₀ᵀ x(t)² dt` (una medida de la energía de la vibración).
 
-```
-GET /api/modulo3/<tipo>
-```
+- **Valor de referencia:** Simpson 1/3 con `n = 2¹⁷` sobre la solución **exacta**. Con ese `n` el error del método es mucho menor que cualquier diferencia que se reporta.
+- **Sobre la simulación:** trapecio, Simpson y Romberg aplicados a `x²` calculado por RK4 (`integral`) y por RK2 (`integral_rk2`), con su error absoluto y relativo (`integral_errores`).
+- **Tabla de refinamiento** (`refinamiento`): para `n = 2, 4, …, 4096`, el valor y el error de cada método sobre la función exacta. En el escenario normal, con `n = 4096`, los errores son 2.6e-7 (trapecio), 1.7e-12 (Simpson) y 3.8e-14 (Romberg). Se ve el orden de cada método.
 
-| `<tipo>` | Escenario |
+En el escenario de estrés el error de la integral sobre RK4 (≈ 6e-3) lo domina el error de la EDO, no el de la integración; por eso Romberg no mejora a Simpson ahí.
+
+---
+
+## 7. Apoyo al Módulo 1 (detención de cabinas)
+
+`modulo1_apoyo` resuelve con RK2 y RK4 el frenado `x' = v`, `v' = −a0·(1 + β·t)`. Con `β = 0` la desaceleración es constante; con `β > 0` es variable. Luego calcula la posición **integrando `v(t)`** con trapecio, Simpson y Romberg y la compara con la solución exacta.
+
+| Caso | `t_det` | Distancia de frenado | Distancia total (con reacción 0.5 s) |
+|---|---|---|---|
+| Constante (`v0 = 12`, `a0 = 2.5`) | 4.800 s | 28.800 m | 34.800 m |
+| Variable (`β = 0.2`) | 3.544 s | 23.119 m | 29.119 m |
+
+En el caso constante coincide con `t = v0/a` y `d = v0²/(2a)`. El tiempo de detención se toma analítico; el Integrante 1 puede reemplazarlo por la raíz que calculen sus métodos (bisección, Newton o secante).
+
+---
+
+## 8. Pruebas con solución analítica
+
+`pruebas_analiticas()` ejecuta y reporta `OK` o `FALLA`:
+
+1. `∫₀² x² dx = 8/3` con trapecio (n = 8, error 0.0208 como predice la teoría), Simpson y Romberg (exactos).
+2. Orden de convergencia con `y' = −y`: al reducir `h` a la mitad, el error de RK2 baja ≈ 4 veces y el de RK4 ≈ 16 veces.
+3. RK4 contra la solución libre exacta (error < 1e-6).
+4. Solución analítica forzada contra RK4 con `h = 0.001` (coinciden a 3e-13).
+5. La segunda columna de Romberg coincide con Simpson.
+
+También están disponibles en `GET /api/pruebas`.
+
+---
+
+## 9. API y formato de salida
+
+| Ruta | Respuesta |
 |---|---|
-| `NORMAL` | `escenario_normal()` |
-| `ESTRES` | `escenario_estres()` |
-| `MAL_CONDICIONADO` | `escenario_mal_condicionado()` |
+| `GET /api/modulo3/<tipo>` | `NORMAL`, `ESTRES` o `MAL_CONDICIONADO` (no distingue mayúsculas). Otro valor: `400` |
+| `GET /api/modulo1_apoyo/<tipo>` | `constante` o `variable` |
+| `GET /api/pruebas` | Resultado de las pruebas analíticas |
 
-El tipo no distingue mayúsculas (hago `tipo.upper()`). Si mandan otro valor, respondo `400` con `{"error": "Escenario no válido"}`.
+Los resultados se calculan una sola vez y se guardan en memoria.
 
-### Formato de la respuesta (JSON)
+Campos principales de `/api/modulo3/<tipo>`:
 
-```json
-{
-  "escenario": "NORMAL",
-  "rk2": { "ts": [...], "xs": [...], "error_max": 0.0 },
-  "rk4": { "ts": [...], "xs": [...], "error_max": 0.0 },
-  "integral": { "trapecio": 0.0, "simpson": 0.0, "romberg": 0.0 },
-  "analitica": [...]
-}
-```
+| Campo | Contenido |
+|---|---|
+| `escenario`, `parametros` | Nombre, parámetros, `h`, `w0`, `zeta` |
+| `rk2`, `rk4` | `ts`, `xs`, `vs`, `errores`, `error_max`, `amplitud_max`, `amplificacion`, `paso`, `convergio`, `tiempo_ms` |
+| `analitica` | Solución exacta `x(t)` para graficar |
+| `iteraciones` | Filas para la tabla `iteracion_resultado` (hasta 200 por método): `numero`, `aproximacion` `{t, x, v}`, `residual`, `error_abs`, `error_rel` |
+| `integral`, `integral_rk2`, `integral_errores`, `integral_referencia` | Integrales de `x²` y sus errores |
+| `refinamiento` | Tabla de refinamiento de los tres métodos |
+| `sensibilidad` | Solo en `MAL_CONDICIONADO` |
 
-- `ts`: tiempos; `xs`: desplazamiento calculado en cada tiempo (lo que se grafica).
-- `error_max`: error máximo absoluto respecto a la referencia del escenario.
-- `integral`: valor aproximado de la integral de `x²` en `[0, 10]` con cada método.
-- `analitica`: solución exacta para graficar (vacía en el escenario de estrés).
+Notas para quien conecte la base de datos:
 
----
-
-## 7. Cómo ejecutarlo
-
-Necesito Python 3 y Flask:
-
-```bash
-pip install flask
-python modulo3.py
-```
-
-(Sustituye `modulo3.py` por el nombre real del archivo.)
-
-Al ejecutarlo pasa esto, en orden:
-
-1. Se imprimen en consola los resultados de los tres escenarios.
-2. Se levanta el servidor en `http://localhost:5001`.
-
-Para probar la API desde el navegador:
-
-- http://localhost:5001/api/modulo3/NORMAL
-- http://localhost:5001/api/modulo3/ESTRES
-- http://localhost:5001/api/modulo3/MAL_CONDICIONADO
+- `convergio` significa que la simulación fue **estable** (valores finitos y sin crecer sin control), no que haya una tolerancia de convergencia.
+- En `iteraciones`, `residual` es el error de la segunda variable de estado (la velocidad), porque en un Runge-Kutta no existe un residual de la ecuación.
+- `error_rel` puede ser `null` cuando la referencia es cero.
 
 ---
 
-## 8. Cosas que tengo presentes
+## 10. Gráficos
 
-- **Reinicio en modo debug:** como uso `debug=True`, Flask reinicia el proceso y la salida de consola puede aparecer **dos veces**. Es normal.
-- **CORS:** si la página web se sirve desde otro puerto u origen, el navegador puede bloquear las peticiones. En ese caso instalaría `flask-cors` y haría `CORS(app)`.
-- **Integral en el escenario de estrés:** ahí integro `x²` usando la solución analítica **libre** (la de `x0 = 1`, sin viento), no la solución forzada. Es un punto a revisar si quiero que la integral represente la energía real bajo el viento; la alternativa sería integrar sobre la referencia RK4 fina.
-- **Costo de cómputo:** cada petición recalcula todo (incluida la referencia con `h = 0.001`). Si se vuelve lento, puedo guardar los resultados en caché al arrancar.
+Se generan en `graficos_modulo3/`, al menos dos por escenario:
+
+- `m3_<escenario>_solucion_error.png`: `x(t)` exacta, RK2 y RK4 superpuestas, y el error absoluto.
+- `m3_<escenario>_integracion.png`: error de la integral frente a `n` para trapecio, Simpson y Romberg.
+- `m3_mal_condicionado_sensibilidad.png`: amplitud permanente `X(w)` y el efecto de un 1 % en `wf`.
+- `m1_apoyo_constante.png` y `m1_apoyo_variable.png`: `v(t)` y posición durante el frenado.
 
 ---
 
-## 9. Estructura del archivo
+## 11. Limitaciones
+
+- El modelo es de un solo grado de libertad y lineal. No representa el comportamiento real de una cabina ni de una estructura; es un modelo educativo con datos sintéticos.
+- La sensibilidad del escenario mal condicionado se mide sobre la amplitud en régimen permanente (fórmula exacta). Con `c = 0.5` el sistema tardaría mucho en llegar a ese régimen, así que la simulación de 40.96 s muestra la respuesta transitoria; el factor de amplificación corresponde al problema matemático, no a lo que se ve en esa ventana de tiempo.
+- RK2 no se vuelve inestable en el escenario de estrés (el amortiguamiento lo contiene), solo pierde precisión. Con amortiguamiento casi nulo y un paso grande sí puede amplificar la amplitud; eso sería un problema de estabilidad del método, distinto del mal condicionamiento.
+
+---
+
+## 12. Estructura del archivo
 
 ```
-1) MÉTODOS NUMÉRICOS     f_oscilador, rk2_heun, rk4, trapecio, simpson, romberg
-2) MODELO Y ESCENARIOS   solucion_analitica, escenario_normal / estres / mal_condicionado
-3) CONSOLA               probar_en_consola
-4) API                   Flask, ruta /api/modulo3/<tipo>
+0) UTILIDADES DE ERROR     error_abs, error_rel
+1) MÉTODOS NUMÉRICOS       f_oscilador, rk2_heun, rk4, trapecio, simpson, romberg (+ versiones sobre datos)
+2) MODELO Y SOL. EXACTAS   solucion_analitica, solucion_analitica_forzada, sensibilidad_amplitud
+3) ESCENARIOS MÓDULO 3     PARAMETROS, ejecutar_escenario, escenario_normal / estres / mal_condicionado
+4) APOYO MÓDULO 1          modulo1_apoyo, casos_modulo1
+5) PRUEBAS ANALÍTICAS      pruebas_analiticas
+6) CONSOLA                 probar_en_consola
+7) GRÁFICOS                generar_graficos
+8) JSON Y CACHÉ            obtener_todos, guardar_json
+9) API                     Flask: /api/modulo3, /api/modulo1_apoyo, /api/pruebas
 ```
